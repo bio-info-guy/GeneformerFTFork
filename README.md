@@ -1,4 +1,10 @@
 ---
+# CUSTOM GITHUB REPO for Geneformer
+- custom repo for geneformer, please download actual models from the original repo on huggingface
+- this repo attempts to optimize finetuning for  geneformer via mix precision training and furhter integration with deepspeed
+- track additional metrics such as AUPR
+
+---
 datasets: ctheodoris/Genecorpus-30M
 license: apache-2.0
 tags:
