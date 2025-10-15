@@ -32,7 +32,7 @@ class GeneformerMultiTask(nn.Module):
         use_attention_pooling=False,
     ):
         super(GeneformerMultiTask, self).__init__()
-        self.config = BertConfig.from_pretrained(pretrained_path)
+        self.config = BertConfig.from_pretrained(pretrained_path, attn_implementation="sdpa")
         self.bert = BertModel(self.config)
         self.num_labels_list = num_labels_list
         self.use_task_weights = use_task_weights

@@ -1,4 +1,5 @@
 from typing import Dict, List, Optional, Union
+import collections
 import json
 import os
 import pickle
@@ -6,7 +7,15 @@ import random
 import torch
 import numpy as np
 import optuna
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    f1_score,
+    accuracy_score,
+    average_precision_score, # For AUPR
+)
+from sklearn.preprocessing import label_binarize
 from sklearn.preprocessing import LabelEncoder
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoConfig, BertConfig, BertModel, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
@@ -58,8 +67,11 @@ def create_model(config, num_labels_list, device, is_distributed=False, local_ra
     if is_distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     
+
     return model
 
+def wrap_model_deepspeed(model, ds_config):
+    pass
 
 def setup_optimizer_and_scheduler(model, config, total_steps):
     """Set up optimizer and learning rate scheduler."""
@@ -129,7 +141,7 @@ def save_hyperparameters(model_save_directory, hyperparams):
     print(f"Hyperparameters saved to {hyperparams_path}")
 
 
-def calculate_metrics(labels=None, preds=None, task_data=None, metric_type="task_specific", return_format="dict"):
+def calculate_metrics(labels=None, preds=None, pred_probs = None, task_data=None, metric_type="task_specific", return_format="dict"):
     if metric_type == "single":
         # Calculate metrics for a single task
         if labels is None or preds is None:
@@ -168,6 +180,11 @@ def calculate_metrics(labels=None, preds=None, task_data=None, metric_type="task
                     f1 = f1_score(labels[task_name], preds[task_name], average="macro")
                     accuracy = accuracy_score(labels[task_name], preds[task_name])
                     result[task_name] = {"f1": f1, "accuracy": accuracy}
+                    if task_name in pred_probs:
+                        classes = list(range(max(labels[task_name])+1)) # temporary fix for lack of some labels, need to pass in actual full label list somehow
+                        y_true_binarized = label_binarize(labels[task_name], classes=classes)
+                        aupr = average_precision_score(y_true_binarized, pred_probs[task_name], average="macro")
+                        result[task_name]['aupr'] = aupr
             return result
         else:
             raise ValueError("For task_specific metrics, either task_data or labels and preds dictionaries must be provided")
@@ -194,6 +211,61 @@ def calculate_metrics(labels=None, preds=None, task_data=None, metric_type="task
     else:
         raise ValueError(f"Unknown metric_type: {metric_type}")
 
+
+def gather_and_average_metrics(local_metrics: dict) -> dict | None:
+    """
+    Gathers metric dictionaries from all processes, calculates the mean for each
+    metric, and returns the result on the main process (rank 0).
+
+    Args:
+        local_metrics (dict): A dictionary of metrics calculated on the current process.
+                              The values should be numbers (int, float, or numpy types).
+
+    Returns:
+        dict or None: On the main process (rank 0), a dictionary with the averaged
+                      metrics. On all other processes, it returns None.
+    """
+    # If not in a distributed environment, just return the local metrics.
+    if not dist.is_initialized():
+        return local_metrics
+
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    # On the main process (rank 0), create a list to store the metrics from all processes.
+    # On other processes, this will be None.
+    gathered_metrics_list = [None] * world_size if rank == 0 else None
+
+    # The `gather_object` function collects pickle-able python objects from all
+    # processes and delivers them to the destination process (dst=0).
+    dist.gather_object(
+        local_metrics,
+        gathered_metrics_list if rank == 0 else None,
+        dst=0
+    )
+
+    # The following block only executes on the main process.
+    if rank == 0:
+        # `gathered_metrics_list` is now a list of dictionaries, for example:
+        # [{'f1': 0.85, 'aupr': 0.92}, {'f1': 0.86, 'aupr': 0.91}, ...]
+        
+        # Use defaultdict to easily aggregate the scores for each metric key.
+        final_res = {}
+        # Get the keys from the first dictionary (assuming all are the same).
+        task_keys = list(gathered_metrics_list[0].keys())
+        metric_keys = list(gathered_metrics_list[0][task_keys[0]].keys())
+        for task in task_keys:
+            aggregated_metrics = {}
+            for metric in metric_keys:
+            # Sum the values for the current metric key across all processes.
+                total_value = sum(metrics[task][metric] for metrics in gathered_metrics_list)
+                # Calculate the average.
+                aggregated_metrics[metric] = total_value / world_size
+            final_res[task] = aggregated_metrics
+        return final_res
+
+    # Other processes don't need to return the averaged metrics.
+    return None
 
 def get_layer_freeze_range(pretrained_path):
     if not pretrained_path:
@@ -295,19 +367,21 @@ def log_training_step(loss, writer, config, epoch, steps_per_epoch, batch_idx):
 
 def log_validation_metrics(task_metrics, val_loss, config, writer, epoch):
     """Log validation metrics to console, TensorBoard, and optionally W&B."""
+    metric_logs = {'metrics/epoch': epoch}
     for task_name, metrics in task_metrics.items():
         print(
             f"{task_name} - Validation F1 Macro: {metrics['f1']:.4f}, Validation Accuracy: {metrics['accuracy']:.4f}"
         )
-        if config.get("use_wandb", False):
-            import wandb
-            wandb.log(
-                {
-                    f"{task_name} Validation F1 Macro": metrics["f1"],
-                    f"{task_name} Validation Accuracy": metrics["accuracy"],
-                }
-            )
-
+        if 'f1' in metrics:
+            metric_logs[f"metrics/{task_name} Macro F1"] = metrics["f1"]
+        if 'accuracy' in metrics:
+            metric_logs[f"metrics/{task_name} accuracy"] = metrics["accuracy"]
+        if 'aupr' in metrics:
+            metric_logs[f"metrics/{task_name} Macro AUPR"] = metrics["aupr"]
+        
+    if config.get("use_wandb", False):
+        import wandb
+        wandb.log(metric_logs)
     writer.add_scalar("Validation Loss", val_loss, epoch)
     for task_name, metrics in task_metrics.items():
         writer.add_scalar(f"{task_name} - Validation F1 Macro", metrics["f1"], epoch)
@@ -460,7 +534,7 @@ def train_distributed(trainer_class, config, train_loader, val_loader, train_cel
         if shared_dict is not None:
             shared_dict['val_loss'] = val_loss
             task_true_labels, task_pred_labels, task_pred_probs = collect_validation_predictions(model, val_loader, device, config)
-            shared_dict['task_metrics'] = calculate_metrics(labels=task_true_labels, preds=task_pred_labels, metric_type="task_specific")
+            shared_dict['task_metrics'] = calculate_metrics(labels=task_true_labels, preds=task_pred_labels, pred_probs=task_pred_probs, metric_type="task_specific")
             shared_dict['model_state_dict'] = {k: v.cpu() for k, v in model.state_dict().items()}
         
         return val_loss, model
@@ -541,7 +615,7 @@ def _distributed_worker(rank, world_size, trainer_class, config, train_loader, v
             )
             
             # Calculate metrics
-            task_metrics = calculate_metrics(labels=task_true_labels, preds=task_pred_labels, metric_type="task_specific")
+            task_metrics = calculate_metrics(labels=task_true_labels, preds=task_pred_labels, pred_probs=task_pred_probs, metric_type="task_specific")
             shared_dict['task_metrics'] = task_metrics
             
             # Store model state dict

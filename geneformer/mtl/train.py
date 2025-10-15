@@ -9,10 +9,12 @@ from tqdm import tqdm
 import optuna
 import functools
 import time
+import numpy as np
 
 from .model import GeneformerMultiTask
 from .utils import (
     calculate_metrics,
+    gather_and_average_metrics,
     get_layer_freeze_range,
     set_seed,
     initialize_wandb,
@@ -40,7 +42,8 @@ class Trainer:
         self.optimizer = None
         self.scheduler = None
         self.writer = None
-        self.is_distributed = config.get("distributed_training", False)
+        self.is_distributed = config.get("distributed_training", False) and not config.get("deepspeed", False)
+        self.deep_speed = config.get("deepspeed", False)
         self.local_rank = config.get("local_rank", 0)
         self.is_main_process = not self.is_distributed or self.local_rank == 0
         
@@ -80,7 +83,7 @@ class Trainer:
         
         # Get gradient accumulation steps from config (default to 1 if not specified)
         accumulation_steps = self.config.get("gradient_accumulation_steps", 1)
-        
+        print(accumulation_steps)
         # Zero gradients at the beginning
         self.optimizer.zero_grad()
         
@@ -99,7 +102,8 @@ class Trainer:
             ]
 
             forward_start = time.time()
-            loss, _, _ = self.model(input_ids, attention_mask, labels)
+            with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+                loss, _, _ = self.model(input_ids, attention_mask, labels)
             
             # Scale loss by accumulation steps for gradient accumulation
             if accumulation_steps > 1:
@@ -315,17 +319,23 @@ class Trainer:
             for epoch in epoch_progress:
                 if self.is_distributed:
                     train_loader.sampler.set_epoch(epoch)
-                    
+                val_loss, task_true_labels, task_pred_labels, task_pred_probs, val_cell_ids = self.validate_model(val_loader)
+                task_metrics = calculate_metrics(labels=task_true_labels, preds=task_pred_labels, pred_probs=task_pred_probs, metric_type="task_specific")
+                gathered_metrics = gather_and_average_metrics(task_metrics)
+                if self.is_main_process:
+                    log_validation_metrics(gathered_metrics, val_loss, self.config, self.writer, self.config["epochs"])
                 train_loss = self.train_epoch(train_loader, epoch)
                 train_losses.append(train_loss)
                 
                 # Run validation after each epoch if configured to do so
                 if self.config.get("validate_each_epoch", False):
-                    val_loss, _, _, _, _ = self.validate_model(val_loader)
+                    val_loss, task_true_labels, task_pred_labels, task_pred_probs, val_cell_ids = self.validate_model(val_loader)
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                    
+                    task_metrics = calculate_metrics(labels=task_true_labels, preds=task_pred_labels, pred_probs=task_pred_probs, metric_type="task_specific")
+                    gathered_metrics = gather_and_average_metrics(task_metrics)
                     if self.is_main_process:
+                        log_validation_metrics(gathered_metrics, val_loss, self.config, self.writer, self.config["epochs"])
                         epoch_progress.set_postfix({
                             "train_loss": f"{train_loss:.4f}",
                             "val_loss": f"{val_loss:.4f}",
@@ -338,10 +348,10 @@ class Trainer:
                         })
 
             val_loss, task_true_labels, task_pred_labels, task_pred_probs, val_cell_ids = self.validate_model(val_loader)
-            task_metrics = calculate_metrics(labels=task_true_labels, preds=task_pred_labels, metric_type="task_specific")
-
+            task_metrics = calculate_metrics(labels=task_true_labels, preds=task_pred_labels, pred_probs=task_pred_probs, metric_type="task_specific")
+            gathered_metrics  = gather_and_average_metrics(task_metrics)
             if self.is_main_process:
-                log_validation_metrics(task_metrics, val_loss, self.config, self.writer, self.config["epochs"])
+                log_validation_metrics(gathered_metrics, val_loss, self.config, self.writer, self.config["epochs"])
 
                 # Save validation predictions
                 save_validation_predictions(
@@ -400,8 +410,9 @@ class Trainer:
             self.model, self.config, len(train_loader)
         )
 
-        if self.is_main_process and self.config.get("use_wandb", False):
-            initialize_wandb(self.config)
+        #if self.is_main_process and self.config.get("use_wandb", False):
+            #initialize_wandb(self.config)
+
         
         return train_loader, val_loader, train_cell_id_mapping, val_cell_id_mapping, num_labels_list
 
@@ -505,18 +516,32 @@ def objective(
         
         val_loss = shared_dict.get('val_loss', float('inf'))
         task_metrics = shared_dict.get('task_metrics', {})
-        
+        # use AUPR as metric to optimize optuna
+        use_aupr = True
+        for task_name, metrics in task_metrics.items():
+            if 'aupr' not in metrics:
+                use_aupr = False
+        if use_aupr:
+            val_loss = np.mean([metrics["aupr"] for task_name, metrics in task_metrics.items()])
+        else:
+            val_loss = np.mean([metrics["f1"] for task_name, metrics in task_metrics.items()])
+
         trial.set_user_attr("model_state_dict", shared_dict.get('model_state_dict', {}))
         trial.set_user_attr("task_weights", trial_config["task_weights"])
         
         if config.get("use_wandb", False):
             import wandb
-            wandb.log({
+            metric_logs = {
                 "trial_number": trial.number,
                 "val_loss": val_loss,
                 **{f"{task_name}_f1": metrics["f1"] for task_name, metrics in task_metrics.items()},
                 **{f"{task_name}_accuracy": metrics["accuracy"] for task_name, metrics in task_metrics.items()},
-            })
+            }
+            if use_aupr:
+                for task_name, metrics in task_metrics.items():
+                    metric_logs[f"{task_name}_aupr"] =  metrics["aupr"]
+                    
+            wandb.log(metric_logs)
             wandb.finish()
             
         return val_loss
@@ -536,10 +561,22 @@ def objective(
             trainer.train_epoch(train_loader, epoch)
 
         val_loss, task_true_labels, task_pred_labels, task_pred_probs, val_cell_ids = trainer.validate_model(val_loader)
-        task_metrics = calculate_metrics(labels=task_true_labels, preds=task_pred_labels, metric_type="task_specific")
+        task_metrics = calculate_metrics(labels=task_true_labels, preds=task_pred_labels, pred_probs=task_pred_probs, metric_type="task_specific")
+        
+        
 
         # Log metrics
         log_validation_metrics(task_metrics, val_loss, trial_config, writer, config["epochs"])
+
+
+        use_aupr = True
+        for task_name, metrics in task_metrics.items():
+            if 'aupr' not in metrics:
+                use_aupr = False
+        if use_aupr:
+            val_loss = np.mean([metrics["aupr"] for task_name, metrics in task_metrics.items()])
+        else:
+            val_loss = np.mean([metrics["f1"] for task_name, metrics in task_metrics.items()])
 
         # Save validation predictions
         save_validation_predictions(
@@ -562,8 +599,7 @@ def objective(
 
         if config.get("use_wandb", False):
             import wandb
-            wandb.log(
-                {
+            metric_logs = {
                     "trial_number": trial.number,
                     "val_loss": val_loss,
                     **{f"{task_name}_f1": metrics["f1"] for task_name, metrics in task_metrics.items()},
@@ -573,7 +609,11 @@ def objective(
                         "lr_scheduler_type", "use_attention_pooling", "max_layers_to_freeze"
                     ]},
                 }
-            )
+            if use_aupr:
+                for task_name, metrics in task_metrics.items():
+                    metric_logs[f"{task_name}_aupr"] =  metrics["aupr"]
+                    
+            wandb.log(metric_logs)
             wandb.finish()
 
     return val_loss
