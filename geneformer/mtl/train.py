@@ -704,7 +704,7 @@ def run_optuna_study(config):
 
     # Create and run the Optuna study
     study = optuna.create_study(
-        direction="minimize",  # Minimize validation loss
+        direction="maximize",  # Maximize metric
         study_name=config["study_name"],
         # storage=config["storage"],
         load_if_exists=True,
